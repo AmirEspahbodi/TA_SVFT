@@ -6,7 +6,6 @@ import numpy as np
 from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_sparse import SparseTensor, transpose
 
 
 def create_orthonormal_matrix(A):
@@ -151,11 +150,13 @@ class SVFTLayer(nn.Module):
 
 
     def get_weights(self):
-        s = SparseTensor(row=self.s_row, col=self.s_col, value=self.s*F.sigmoid(self.gate))
-        s_pre = SparseTensor(row=self.s_pre_row, col=self.s_pre_col, value=self.s_pre)
-        del_s = s_pre + s
-        weight = (del_s @ self.v).T
-        weight = weight @ self.u.T
+        # Native COO preserves duplicate-coordinate summation in the legacy random path.
+        # Explicit shape also handles supports that do not touch the last row/column.
+        index = torch.stack((self.s_row, self.s_col))
+        sparse = torch.sparse_coo_tensor(index, self.s * torch.sigmoid(self.gate),
+                                         (self.n, self.n)).coalesce()
+        projected = torch.sparse.mm(sparse, self.v) + self.s_pre[:, None] * self.v
+        weight = projected.T @ self.u.T
         return weight
     
 

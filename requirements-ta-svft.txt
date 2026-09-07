@@ -1,0 +1,10 @@
+# Install a matching torch/torchvision pair for your CPU/CUDA platform first.
+torch>=2.2
+torchvision>=0.17
+numpy>=1.26
+transformers==4.44.2
+accelerate==0.34.2
+datasets==2.21.0
+Pillow>=10
+tqdm>=4.27
+pytest>=8

@@ -1,6 +1,21 @@
 # SVFT: Singular Vector guided Fine Tuning
 
-[Optimized version coming soon]
+## TA-SVFT successor implementation
+
+Task-Adaptive SVFT is available with global gradient-selected spectral support,
+full-spectrum diagonal adaptation, optional frozen task-derived rectangular
+complements, and periodic support refinement. The original SVFT path is retained.
+
+See [TA-SVFT setup, mathematics, CLI, checkpoints and limitations](docs/TA_SVFT.md).
+
+```bash
+python -m pip install -r requirements-ta-svft.txt
+OMP_NUM_THREADS=1 python -m pytest -q
+bash vision_experiments/run_ta_svft.sh
+```
+
+Use a matching torch/torchvision CPU or CUDA installation. The commands below
+are the retained upstream language-model workflows; their dependencies are separate.
 
 ### Installing Required Packages
 

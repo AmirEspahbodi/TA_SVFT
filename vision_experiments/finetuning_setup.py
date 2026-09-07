@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from functools import partial
 
 import torch
-import evaluate
 import numpy as np
 from torch import optim
 from datasets import load_dataset
@@ -16,8 +15,6 @@ from transformers import (
     HfArgumentParser,
     AutoImageProcessor,
     AutoModelForImageClassification,
-    get_cosine_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
 )
 from torchvision.transforms import (
     Compose,
@@ -25,23 +22,24 @@ from torchvision.transforms import (
     Resize,
     ToTensor,
 )
-from peft import get_peft_model, VeraConfig, BOFTConfig, LoraConfig
 
 import sys
-sys.path.append("../")
-from svft.svft_layers import *
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from svft.ta_svft import TASVFT, TASVFTConfig, vit_targets
+from svft.trainer import TASVFTTrainer
 
 
 ##########################
 # Metrics
 ##########################
 
-metric = evaluate.load("accuracy")
+
 
 
 def compute_metrics(eval_pred):
     predictions = np.argmax(eval_pred.predictions, axis=1)
-    return metric.compute(predictions=predictions, references=eval_pred.label_ids)
+    return {"accuracy": float(np.mean(predictions == eval_pred.label_ids))}
 
 
 ##########################
@@ -62,6 +60,11 @@ def reset_seed(SEED=0):
 
 def get_trainable_params_dict(model):
     total_p = sum(p.numel() for p in model.parameters())
+    # TA-SVFT registers frozen original weights/biases as buffers, bases separately.
+    if hasattr(model, "_ta_svft"):
+        from svft.ta_svft import SpectralLinear
+        total_p += sum(m.weight.numel() + (0 if m.bias is None else m.bias.numel())
+                       for m in model.modules() if isinstance(m, SpectralLinear))
     trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     clf_trainable_p = sum(
         p.numel()
@@ -287,7 +290,7 @@ class ScriptArguments:
         "resisc45",
     ] = field(default="cifar100", metadata={"help": "Dataset name"})
     finetuning_method: Literal[
-        "vera", "boft", "lora", "dora", "svft", "head", "full"
+        "vera", "boft", "lora", "dora", "svft", "ta_svft", "head", "full"
     ] = field(default="head", metadata={"help": "Finetuning method"})
     clf_learning_rate: float = field(
         default=1e-3, metadata={"help": "Classifier learning rate"}
@@ -295,6 +298,21 @@ class ScriptArguments:
     other_learning_rate: float = field(
         default=1e-4, metadata={"help": "Other learning rate"}
     )
+
+    ## TA-SVFT: global budget excludes the diagonal and classifier.
+    ta_off_budget: int = 1024
+    ta_diagonal: bool = True
+    ta_complement_rank: int = 4
+    ta_calibration_batches: int = 8
+    ta_selection: str = "gradient"
+    ta_update_interval: int = 0
+    ta_freeze_step: int = 1000
+    ta_replace_fraction: float = 0.1
+    ta_basis_dtype: str = "float32"
+    ta_detailed_support: bool = False
+    ta_adapter_checkpoint: str = ""
+    ta_families: List[str] = field(default_factory=lambda: ["q", "k", "v", "o", "up", "down"])
+    svft_pattern: str = "banded"
 
     ## BOFT
     boft_block_size: int = field(default=0, metadata={"help": "BOFT block size (m)"})
@@ -320,14 +338,18 @@ class ScriptArguments:
 
 def main():
     import json
-    import wandb
     from pprint import pprint
 
-    wandb.init(mode="disabled")
+
 
     parser = HfArgumentParser((ScriptArguments, TrainingArguments))
     script_args, training_args = parser.parse_args_into_dataclasses()
 
+    if script_args.finetuning_method == "ta_svft":
+        # Raw image columns are needed by the dataset's on-the-fly transform.
+        training_args.remove_unused_columns = False
+        if script_args.ta_adapter_checkpoint and training_args.resume_from_checkpoint:
+            raise ValueError("Choose adapter warm start or full Trainer resume, not both")
     reset_seed(training_args.seed)
 
     ## Load dataset
@@ -354,10 +376,17 @@ def main():
     print_trainable_parameters(model)
 
     # Get Target Modules
-    if not script_args.target_modules:
+    if not script_args.target_modules and script_args.finetuning_method != "ta_svft":
         script_args.target_modules = get_target_modules(
             model_name, script_args.finetuning_method
         )
+
+    ta_controller = None
+    if script_args.finetuning_method in {"vera", "boft", "lora", "dora"}:
+        from peft import get_peft_model, VeraConfig, BOFTConfig, LoraConfig
+    if script_args.finetuning_method == "svft":
+        from svft.svft_layers import (freeze_model, get_target_modules_list,
+            create_and_replace_modules, LinearWithSVFT, replace_svft_with_fused_linear)
 
     # Set fine-tuning config
     if script_args.finetuning_method == "vera":
@@ -399,12 +428,28 @@ def main():
         for n, p in model.named_parameters():
             if all(c not in n for c in classifier_modules):
                 p.requires_grad = False
-    elif script_args.finetuning_method in ["svft", "full"]:
+    elif script_args.finetuning_method in ["svft", "ta_svft", "full"]:
         pass
     else:
         raise ValueError("Unknown finetuning method")
 
-    if script_args.finetuning_method == "svft":
+    if script_args.finetuning_method == "ta_svft":
+        peft_model = model
+        if script_args.ta_adapter_checkpoint:
+            ta_controller = TASVFT.load_adapter(model, script_args.ta_adapter_checkpoint)
+        else:
+            config = TASVFTConfig(
+                off_budget=script_args.ta_off_budget, diagonal=script_args.ta_diagonal,
+                complement_rank=script_args.ta_complement_rank,
+                calibration_batches=script_args.ta_calibration_batches,
+                selection=script_args.ta_selection, seed=training_args.seed,
+                update_interval=script_args.ta_update_interval,
+                freeze_step=script_args.ta_freeze_step,
+                replace_fraction=script_args.ta_replace_fraction,
+                basis_dtype=script_args.ta_basis_dtype)
+            targets = script_args.target_modules or vit_targets(model, script_args.ta_families)
+            ta_controller = TASVFT(model, targets, config, decompose=not bool(training_args.resume_from_checkpoint))
+    elif script_args.finetuning_method == "svft":
         peft_model = model
         modules_to_save_list = get_target_modules_list(
             peft_model, get_classifier_modules(model_name)
@@ -413,7 +458,7 @@ def main():
         target_modules_list = get_target_modules_list(
             peft_model, script_args.target_modules
         )
-        create_and_replace_modules(peft_model, target_modules_list, partial(LinearWithSVFT, off_diag=script_args.svft_rank))
+        create_and_replace_modules(peft_model, target_modules_list, partial(LinearWithSVFT, off_diag=script_args.svft_rank, pattern=script_args.svft_pattern))
     elif script_args.finetuning_method in ["head", "full"]:
         peft_model = model
     else:
@@ -451,47 +496,42 @@ def main():
         weight_decay=training_args.weight_decay,
     )
 
-    num_train_steps = (
-        len(dataset_train)
-        // training_args.per_device_train_batch_size
-        * training_args.num_train_epochs
-    )
-
-    if training_args.lr_scheduler_type == "cosine":
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=int(num_train_steps * training_args.warmup_ratio),
-            num_training_steps=num_train_steps,
-        )
-    elif training_args.lr_scheduler_type == "linear":
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=int(num_train_steps * training_args.warmup_ratio),
-            num_training_steps=num_train_steps,
-        )
-
-    trainer = Trainer(
+    # Trainer computes scheduler length from actual optimizer steps (including accumulation).
+    trainer_class = TASVFTTrainer if ta_controller is not None else Trainer
+    extra = {"ta_controller": ta_controller, "detailed_support": script_args.ta_detailed_support} if ta_controller else {}
+    trainer = trainer_class(
         peft_model,
         args,
-        optimizers=(optimizer, scheduler),
+        optimizers=(optimizer, None),
         train_dataset=dataset_train,
         eval_dataset=dataset_val,
         tokenizer=image_processor,
         compute_metrics=compute_metrics,
         data_collator=collate_fn,
+        **extra,
     )
 
-    train_results = trainer.train()
+    train_results = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint or None)
     with open(
-        training_args.output_dir + f"final_train_results_{training_args.seed}.json", "w"
+        str(Path(training_args.output_dir) / f"final_train_results_{training_args.seed}.json"), "w"
     ) as f:
-        json.dump(train_results, f, indent=4)
+        json.dump(train_results.metrics, f, indent=4)
 
-    if script_args.finetuning_method == "svft":
-        create_and_replace_modules(peft_model, target_modules_list, reset_from_svft)
+    if ta_controller is not None:
+        ta_controller.validate_support()
+        ta_controller.export_report(Path(training_args.output_dir) / "ta_support.json", script_args.ta_detailed_support)
+        ta_controller.save_adapter(Path(training_args.output_dir) / "ta_adapter.pt")
+        params_dict.update(ta_controller.report())
+        peft_model = ta_controller.merge()
+        peft_model.save_pretrained(Path(training_args.output_dir) / "merged")
+        image_processor.save_pretrained(Path(training_args.output_dir) / "merged")
+    elif script_args.finetuning_method == "svft":
+        replace_svft_with_fused_linear(peft_model, target_modules_list)
     elif script_args.finetuning_method not in {"svft", "head", "full"}:
         peft_model = peft_model.merge_and_unload()
 
+    trainer.model = peft_model
+    trainer.model_wrapped = peft_model
     eval_results = trainer.evaluate(dataset_test)
     print(eval_results)
 
@@ -509,9 +549,9 @@ def main():
     pprint(eval_results, indent=4)
 
     with open(
-        training_args.output_dir + f"final_eval_results_{training_args.seed}.json", "w"
+        str(Path(training_args.output_dir) / f"final_eval_results_{training_args.seed}.json"), "w"
     ) as f:
-        json.dump(eval_results, f, indent=4)
+        json.dump(eval_results, f, indent=4, default=str)
 
     # Save to results.json
     try:
@@ -522,7 +562,7 @@ def main():
 
     results.append(eval_results)
     with open(script_args.results_json, "w") as f:
-        json.dump(results, f, indent=4)
+        json.dump(results, f, indent=4, default=str)
 
 
 if __name__ == "__main__":
