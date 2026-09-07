@@ -1,6 +1,6 @@
 # SVFT: Singular Vector guided Fine Tuning
 
-## TA-SVFT successor implementation
+## TA-SVFT implementation
 
 Task-Adaptive SVFT is available with global gradient-selected spectral support,
 full-spectrum diagonal adaptation, optional frozen task-derived rectangular
